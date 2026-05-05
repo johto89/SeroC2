@@ -9,7 +9,22 @@ public static class CertificateHelper
     private static readonly string CertDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SeroServer");
     private static readonly string CertPath = Path.Combine(CertDir, "server.pfx");
-    private const string CertPassword = "sero_tls_2024";
+    private static readonly string PasswordPath = Path.Combine(
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SeroServer"), "cert.key");
+
+    private static string CertPassword
+    {
+        get
+        {
+            if (File.Exists(PasswordPath))
+                return File.ReadAllText(PasswordPath).Trim();
+            // Generate and persist a new random password
+            var pwd = Convert.ToBase64String(RandomNumberGenerator.GetBytes(18));
+            Directory.CreateDirectory(CertDir);
+            File.WriteAllText(PasswordPath, pwd);
+            return pwd;
+        }
+    }
 
     /// <summary>
     /// Load or generate a self-signed TLS certificate.
@@ -32,7 +47,7 @@ public static class CertificateHelper
         return GenerateAndSave();
     }
 
-    private static X509Certificate2 GenerateAndSave()
+    public static X509Certificate2 GenerateAndSave()
     {
         using var rsa = RSA.Create(2048);
         var req = new CertificateRequest(
@@ -67,10 +82,28 @@ public static class CertificateHelper
     /// </summary>
     public static void ImportCertificate(string pfxPath, string? password = null)
     {
-        // Validate the file is a valid certificate
-        var cert = password != null
-            ? X509CertificateLoader.LoadPkcs12FromFile(pfxPath, password)
-            : X509CertificateLoader.LoadPkcs12FromFile(pfxPath, "");
+        X509Certificate2? cert = null;
+
+        const X509KeyStorageFlags flags = X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet;
+
+        if (password != null)
+        {
+            cert = X509CertificateLoader.LoadPkcs12FromFile(pfxPath, password, flags);
+        }
+        else
+        {
+            foreach (var pwd in new string?[] { "", CertPassword, null })
+            {
+                try
+                {
+                    cert = X509CertificateLoader.LoadPkcs12FromFile(pfxPath, pwd ?? "", flags);
+                    break;
+                }
+                catch { }
+            }
+            if (cert == null)
+                throw new InvalidOperationException("Could not read the certificate. It may require a password.");
+        }
 
         if (!cert.HasPrivateKey)
             throw new InvalidOperationException("The certificate must contain a private key.");
@@ -81,13 +114,71 @@ public static class CertificateHelper
     }
 
     /// <summary>
-    /// Export the full .pfx certificate (with private key).
+    /// Export the full .pfx certificate (with private key) to a chosen path, with no password.
+    /// The user can import it without needing to type anything.
     /// </summary>
     public static void ExportPfx(string destinationPath)
     {
         if (!File.Exists(CertPath))
-            throw new FileNotFoundException("No certificate found. Start the server first.");
-        File.Copy(CertPath, destinationPath, overwrite: true);
+            GenerateAndSave();
+        var cert = X509CertificateLoader.LoadPkcs12FromFile(CertPath, CertPassword,
+            X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+        // Export with empty password so no password is needed on import
+        File.WriteAllBytes(destinationPath, cert.Export(X509ContentType.Pfx, ""));
+    }
+
+    /// <summary>
+    /// Generate a new certificate, save internally, and export a no-password copy to destinationPath.
+    /// </summary>
+    public static void GenerateAndExportTo(string destinationPath)
+    {
+        var cert = GenerateAndSave();
+        File.WriteAllBytes(destinationPath, cert.Export(X509ContentType.Pfx, ""));
+    }
+
+    /// <summary>
+    /// Export cert + auth key together as a JSON backup.
+    /// No PFX password needed on import.
+    /// </summary>
+    public static void ExportServerBackup(string destinationPath, string authKey)
+    {
+        if (!File.Exists(CertPath))
+            GenerateAndSave();
+
+        var cert = X509CertificateLoader.LoadPkcs12FromFile(CertPath, CertPassword,
+            X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+        var certB64 = Convert.ToBase64String(cert.Export(X509ContentType.Pfx, ""));
+        var json = System.Text.Json.JsonSerializer.Serialize(
+            new { cert = certB64, authKey },
+            new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
+        File.WriteAllText(destinationPath, json);
+    }
+
+    /// <summary>
+    /// Import a server backup JSON file (cert + auth key).
+    /// Returns the embedded auth key, or null if the file has none.
+    /// </summary>
+    public static string? ImportServerBackup(string backupPath)
+    {
+        var json = File.ReadAllText(backupPath);
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("cert", out var certProp))
+            throw new InvalidOperationException("Invalid backup file: missing cert field.");
+
+        var certBytes = Convert.FromBase64String(certProp.GetString()!);
+        var cert = X509CertificateLoader.LoadPkcs12(certBytes, "",
+            X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+
+        if (!cert.HasPrivateKey)
+            throw new InvalidOperationException("The certificate must contain a private key.");
+
+        Directory.CreateDirectory(CertDir);
+        File.WriteAllBytes(CertPath, cert.Export(X509ContentType.Pfx, CertPassword));
+
+        string? authKey = root.TryGetProperty("authKey", out var keyProp) ? keyProp.GetString() : null;
+        return authKey;
     }
 
     /// <summary>

